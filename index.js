@@ -21,6 +21,21 @@ const oauth2Client = new google.auth.OAuth2(
   REDIRECT_URI
 );
 
+const DATA_FILE = path.join(__dirname, 'fetchedEmails.json');
+
+// Utility to load previous state
+const loadState = () => {
+  if (fs.existsSync(DATA_FILE)) {
+    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+  }
+  return { messageIds: [], senderCounts: {}, nextPageToken: null };
+};
+
+// Utility to save state
+const saveState = (state) => {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+};
+
 // 🔁 Load tokens if available
 if (fs.existsSync(TOKEN_PATH)) {
   const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
@@ -113,6 +128,77 @@ app.get('/emails', async (req, res) => {
   } catch (error) {
     console.error('❌ Error listing emails:', error);
     res.status(500).send('Failed to list emails');
+  }
+});
+
+app.get('/top-senders', async (req, res) => {
+  try {
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    const state = loadState();
+    const { messageIds, senderCounts } = state;
+    let { nextPageToken } = state;
+
+    let fetched = 0;
+    const maxBatch = 1000; // max emails per request (adjust as needed)
+
+    while (fetched < maxBatch) {
+      const response = await gmail.users.messages.list({
+        userId: 'me',
+        maxResults: 500,
+        pageToken: nextPageToken || undefined,
+      });
+
+      const messages = response.data.messages || [];
+      nextPageToken = response.data.nextPageToken || null;
+
+      // Filter out already fetched message IDs
+      const newMessages = messages.filter(msg => !messageIds.includes(msg.id));
+      fetched += newMessages.length;
+
+      // Fetch sender info
+      await Promise.all(
+        newMessages.map(async (msg) => {
+          const email = await gmail.users.messages.get({
+            userId: 'me',
+            id: msg.id,
+            format: 'metadata',
+            metadataHeaders: ['From'],
+          });
+
+          const fromHeader = email.data.payload.headers.find(h => h.name === 'From');
+          if (fromHeader) {
+            const from = fromHeader.value;
+            senderCounts[from] = (senderCounts[from] || 0) + 1;
+          }
+
+          // Add to processed list
+          messageIds.push(msg.id);
+        })
+      );
+
+      // Save progress
+      saveState({ messageIds, senderCounts, nextPageToken });
+
+      if (!nextPageToken) break; // all emails fetched
+    }
+
+    // Return top 5 senders
+    const sortedSenders = Object.entries(senderCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([sender, count]) => ({ sender, count }));
+
+    res.json({
+      status: 'partial',
+      fetched: fetched,
+      totalProcessed: messageIds.length,
+      topSenders: sortedSenders,
+      done: !nextPageToken,
+    });
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).send('Failed to get top senders');
   }
 });
 
